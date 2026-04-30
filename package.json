@@ -1,0 +1,20 @@
+{
+  "name": "liquidsoap",
+  "version": "1.0.0",
+  "description": "",
+  "main": "stream_controller.js",
+  "scripts": {
+    "start": "node stream_controller.js",
+    "dev": "node --watch stream_controller.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "fastify": "^5.8.5"
+  }
+}
