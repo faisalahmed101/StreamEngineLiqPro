@@ -5,6 +5,7 @@ const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const Fastify = require("fastify");
 const cors = require("@fastify/cors");
+require('dotenv').config();
 
 const app = Fastify({ logger: true });
 
@@ -19,7 +20,14 @@ const DOWNLOADS_DIR = path.join(ROOT_DIR, "downloads");
 const LIQUIDSOAP_BIN = process.env.LIQUIDSOAP_BIN || "liquidsoap";
 const HOST = process.env.STREAM_API_HOST || "0.0.0.0";
 const PORT = Number(process.env.STREAM_API_PORT || 8090);
-const API_KEY = process.env.STREAM_API_KEY || "";
+
+// API_KEY mandatory — না থাকলে boot-এই crash করবে
+const API_KEY = process.env.STREAM_API_KEY;
+if (!API_KEY || API_KEY.trim() === "") {
+  console.error("[fatal] STREAM_API_KEY environment variable is required but not set.");
+  console.error("[fatal] Set it before starting: STREAM_API_KEY=your-secret-key node stream_controller.js");
+  process.exit(1);
+}
 
 // Stream শুরু করার জন্য minimum bytes (5MB)
 const MIN_BYTES_TO_START = 5 * 1024 * 1024;
@@ -119,11 +127,6 @@ function isRemoteUrl(filePath) {
 
 // ─── Download with partial-ready callback ─────────────────────────────────────
 
-/**
- * File download করে।
- * onPartialReady(tmpPath) — MIN_BYTES_TO_START পৌঁছালে একবার call হয়।
- * resolve হয় download পুরো complete হলে।
- */
 function downloadFileProgressive(url, destPath, id, onPartialReady) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith("https") ? require("https") : require("http");
@@ -152,7 +155,6 @@ function downloadFileProgressive(url, destPath, id, onPartialReady) {
         res.on("data", (chunk) => {
           bytesReceived += chunk.length;
 
-          // MIN_BYTES_TO_START পৌঁছালে stream start করো
           if (!partialFired && bytesReceived >= MIN_BYTES_TO_START) {
             partialFired = true;
             console.log(`[${id}] Partial ready at ${(bytesReceived / 1024 / 1024).toFixed(1)}MB — starting stream`);
@@ -161,9 +163,9 @@ function downloadFileProgressive(url, destPath, id, onPartialReady) {
         });
 
         res.pipe(file);
+
         file.on("finish", () => {
           file.close(() => {
-            // Download শেষ হলেও onPartialReady fire হয়নি থাকলে (ছোট file) এখন করো
             if (!partialFired) {
               partialFired = true;
               console.log(`[${id}] File complete (${(bytesReceived / 1024 / 1024).toFixed(1)}MB) — starting stream`);
@@ -197,19 +199,11 @@ function downloadFileProgressive(url, destPath, id, onPartialReady) {
 
 // ─── Progressive resolve ──────────────────────────────────────────────────────
 
-/**
- * সব file parallel-এ download শুরু করে।
- * প্রথম file এর MIN_BYTES_TO_START পৌঁছালেই stream চালু হয়।
- * বাকিগুলো background-এ download হতে থাকে, হলে playlist update হয়।
- *
- * @returns {Promise<string[]>} downloadedLocalPaths — cleanup এর জন্য
- */
 async function resolveFilesProgressive(id, files, playlistPath, onStreamReady) {
   const resolved = new Array(files.length).fill(null);
   const downloadedLocalPaths = [];
   let streamStarted = false;
 
-  // Stream start করার helper — একবারই call হবে
   async function maybeStartStream() {
     if (streamStarted || resolved[0] === null) return;
     streamStarted = true;
@@ -217,7 +211,6 @@ async function resolveFilesProgressive(id, files, playlistPath, onStreamReady) {
     await onStreamReady(resolved.filter(Boolean));
   }
 
-  // Playlist update করার helper — background download complete হলে call হয়
   async function updatePlaylistIfRunning() {
     const readyFiles = resolved.filter(Boolean);
     if (readyFiles.length > 0) {
@@ -229,7 +222,7 @@ async function resolveFilesProgressive(id, files, playlistPath, onStreamReady) {
     }
   }
 
-  // প্রথম file — partial ready হলেই stream start করবো
+  // প্রথম file — partial ready হলেই stream start
   const firstFilePromise = (async () => {
     const file = files[0];
     if (!isRemoteUrl(file)) {
@@ -242,7 +235,6 @@ async function resolveFilesProgressive(id, files, playlistPath, onStreamReady) {
     const hash = crypto.createHash("md5").update(file).digest("hex").slice(0, 8);
     const tmpPath = path.join(DOWNLOADS_DIR, `${id}_${hash}${ext}`);
 
-    // Cache check
     try {
       await fsp.access(tmpPath);
       console.log(`[${id}] Already cached [0]: ${tmpPath}`);
@@ -254,7 +246,6 @@ async function resolveFilesProgressive(id, files, playlistPath, onStreamReady) {
 
     console.log(`[${id}] Downloading [0]: ${file}`);
 
-    // Partial ready callback — MIN_BYTES_TO_START পৌঁছালে stream start
     await downloadFileProgressive(file, tmpPath, id, async () => {
       downloadedLocalPaths.push(tmpPath);
       resolved[0] = toLiquidsoapPath(tmpPath);
@@ -262,11 +253,10 @@ async function resolveFilesProgressive(id, files, playlistPath, onStreamReady) {
     });
 
     console.log(`[${id}] Complete [0]: ${tmpPath}`);
-    // Download complete হলে playlist-এ already আছে, update করো
     await updatePlaylistIfRunning();
   })();
 
-  // বাকি files — background-এ download, complete হলে playlist update
+  // বাকি files — background download
   const restPromises = files.slice(1).map(async (file, idx) => {
     const i = idx + 1;
 
@@ -291,10 +281,7 @@ async function resolveFilesProgressive(id, files, playlistPath, onStreamReady) {
 
     console.log(`[${id}] Downloading [${i}]: ${file}`);
 
-    // বাকি files এর জন্য partial callback দরকার নেই, শুধু complete হলেই playlist update
-    await downloadFileProgressive(file, tmpPath, id, () => {
-      // partial ready — বাকি files এর জন্য কিছু করার নেই
-    });
+    await downloadFileProgressive(file, tmpPath, id, () => {});
 
     downloadedLocalPaths.push(tmpPath);
     resolved[i] = toLiquidsoapPath(tmpPath);
@@ -302,10 +289,8 @@ async function resolveFilesProgressive(id, files, playlistPath, onStreamReady) {
     await updatePlaylistIfRunning();
   });
 
-  // প্রথম file এর stream start হওয়া পর্যন্ত wait করো
   await firstFilePromise;
 
-  // বাকিগুলো background-এ চলবে
   Promise.all(restPromises)
     .then(() => console.log(`[${id}] All files downloaded and playlist finalized.`))
     .catch((err) => console.error(`[${id}] Background download error: ${err.message}`));
@@ -469,10 +454,11 @@ async function stopStream(id) {
     }
   }
 
-  // Cleanup — .liq, playlist.txt, downloaded videos
+  // Cleanup — .liq, playlist.txt, log file, downloaded videos
   await Promise.all([
     deleteFileSafe(job.liqPath),
     deleteFileSafe(job.playlistPath),
+    deleteFileSafe(job.logPath),
     ...job.downloadedFiles.map((f) => deleteFileSafe(f)),
   ]);
 
@@ -517,11 +503,26 @@ async function updatePlaylist(id, files, applyMode = "after_current") {
 
 app.register(cors, { origin: true });
 
+// API Key auth — সব route এ mandatory
 app.addHook("onRequest", async (request, reply) => {
-  if (!API_KEY) return;
+  // /health route auth ছাড়াই accessible রাখো (uptime check এর জন্য)
+  if (request.url === "/health") return;
+
   const provided = request.headers["x-api-key"];
-  if (provided !== API_KEY) {
-    reply.code(401).send({ error: "unauthorized" });
+
+  if (!provided) {
+    return reply.code(401).send({ error: "unauthorized", message: "Unauthorized, you cannot access this resource." });
+  }
+
+  // Timing-safe comparison — brute force থেকে সুরক্ষা
+  const keyBuf = Buffer.from(API_KEY);
+  const providedBuf = Buffer.from(provided);
+
+  if (
+    keyBuf.length !== providedBuf.length ||
+    !crypto.timingSafeEqual(keyBuf, providedBuf)
+  ) {
+    return reply.code(401).send({ error: "unauthorized", message: "Invalid API key." });
   }
 });
 
@@ -578,6 +579,7 @@ async function boot() {
   await app.listen({ host: HOST, port: PORT });
   app.log.info(`stream controller listening on http://${HOST}:${PORT}`);
   app.log.info(`liquidsoap binary: ${LIQUIDSOAP_BIN}`);
+  app.log.info(`API key auth: enabled`);
 }
 
 boot().catch((err) => {
