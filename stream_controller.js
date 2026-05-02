@@ -2,6 +2,7 @@ const path = require("node:path");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const Fastify = require("fastify");
 const cors = require("@fastify/cors");
 
@@ -13,42 +14,60 @@ const SCRIPTS_DIR = path.join(RUNTIME_DIR, "scripts");
 const LOGS_DIR = path.join(RUNTIME_DIR, "logs");
 const PLAYLISTS_DIR = path.join(RUNTIME_DIR, "playlists");
 const NORMALIZED_DIR = path.join(RUNTIME_DIR, "normalized");
+const DOWNLOADS_DIR = path.join(ROOT_DIR, "downloads");
 
 const LIQUIDSOAP_BIN = process.env.LIQUIDSOAP_BIN || "liquidsoap";
-const HOST = process.env.STREAM_API_HOST || "127.0.0.1";
+const HOST = process.env.STREAM_API_HOST || "0.0.0.0";
 const PORT = Number(process.env.STREAM_API_PORT || 8090);
 const API_KEY = process.env.STREAM_API_KEY || "";
 
-/** @type {Map<string, {id: string, process: import("node:child_process").ChildProcessWithoutNullStreams, liqPath: string, logPath: string, playlistPath: string, createdAt: number, config: {id?: string, files: string[], url?: string, stream_key?: string, copy_mode?: boolean}}>} */
+// Stream শুরু করার জন্য minimum bytes (5MB)
+const MIN_BYTES_TO_START = 5 * 1024 * 1024;
+
+/** @type {Map<string, {
+ *   id: string,
+ *   process: import("node:child_process").ChildProcessWithoutNullStreams,
+ *   liqPath: string,
+ *   logPath: string,
+ *   playlistPath: string,
+ *   downloadedFiles: string[],
+ *   createdAt: number,
+ *   config: object
+ * }>} */
 const jobs = new Map();
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function toLiquidsoapPath(inputPath) {
   return String(inputPath).replaceAll("\\", "/");
 }
 
+function toOsPath(liqPath) {
+  if (process.platform === "win32") {
+    return String(liqPath).replaceAll("/", "\\");
+  }
+  return liqPath;
+}
+
 function ensureDirs() {
-  for (const dir of [RUNTIME_DIR, SCRIPTS_DIR, LOGS_DIR, PLAYLISTS_DIR, NORMALIZED_DIR]) {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+  for (const dir of [
+    RUNTIME_DIR, SCRIPTS_DIR, LOGS_DIR,
+    PLAYLISTS_DIR, NORMALIZED_DIR, DOWNLOADS_DIR,
+  ]) {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   }
 }
 
 function makeScript(payload, playlistPath) {
   let url = payload.url;
   const streamKey = payload.stream_key;
-  if (!url && streamKey) {
-    url = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
-  }
-  if (!url) {
-    throw new Error("Provide either `url` or `stream_key`.");
-  }
+  if (!url && streamKey) url = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
+  if (!url) throw new Error("Provide either `url` or `stream_key`.");
 
-  // Safer default for SaaS workloads: transcode unless explicitly requested.
   const copyMode = payload.copy_mode === true;
   const avLine = copyMode
     ? "%video.copy, %audio.copy"
-    : "%video(codec=\"libx264\"), %audio(codec=\"aac\")";
+    : '%video(codec="libx264"), %audio(codec="aac")';
   const playlistPathLs = toLiquidsoapPath(playlistPath);
 
   return `settings.log.stdout := true
@@ -82,18 +101,219 @@ async function readLastLines(filePath, count = 120) {
     const text = await fsp.readFile(filePath, "utf8");
     return text.split(/\r?\n/).slice(-count).join("\n");
   } catch (err) {
-    if (err && err.code === "ENOENT") return "";
+    if (err?.code === "ENOENT") return "";
     throw err;
   }
 }
 
-async function writePlaylistFile(playlistPath, files) {
-  if (!Array.isArray(files) || files.length === 0) {
+async function writePlaylistFile(playlistPath, resolvedFiles) {
+  if (!Array.isArray(resolvedFiles) || resolvedFiles.length === 0) {
     throw new Error("`files` array is required and cannot be empty.");
   }
-  const normalized = files.map((item) => toLiquidsoapPath(item));
-  await fsp.writeFile(playlistPath, `${normalized.join("\n")}\n`, "utf8");
+  await fsp.writeFile(playlistPath, `${resolvedFiles.join("\n")}\n`, "utf8");
 }
+
+function isRemoteUrl(filePath) {
+  return typeof filePath === "string" && /^https?:\/\//i.test(filePath);
+}
+
+// ─── Download with partial-ready callback ─────────────────────────────────────
+
+/**
+ * File download করে।
+ * onPartialReady(tmpPath) — MIN_BYTES_TO_START পৌঁছালে একবার call হয়।
+ * resolve হয় download পুরো complete হলে।
+ */
+function downloadFileProgressive(url, destPath, id, onPartialReady) {
+  return new Promise((resolve, reject) => {
+    const proto = url.startsWith("https") ? require("https") : require("http");
+    let partialFired = false;
+    let bytesReceived = 0;
+
+    fsp.mkdir(path.dirname(destPath), { recursive: true }).then(() => {
+      const file = fs.createWriteStream(destPath);
+
+      const req = proto.get(url, (res) => {
+        // Redirect
+        if ([301, 302, 307, 308].includes(res.statusCode)) {
+          file.close();
+          fsp.unlink(destPath).catch(() => {});
+          return downloadFileProgressive(res.headers.location, destPath, id, onPartialReady)
+            .then(resolve)
+            .catch(reject);
+        }
+
+        if (res.statusCode !== 200) {
+          file.close();
+          fsp.unlink(destPath).catch(() => {});
+          return reject(new Error(`Download failed: HTTP ${res.statusCode} for ${url}`));
+        }
+
+        res.on("data", (chunk) => {
+          bytesReceived += chunk.length;
+
+          // MIN_BYTES_TO_START পৌঁছালে stream start করো
+          if (!partialFired && bytesReceived >= MIN_BYTES_TO_START) {
+            partialFired = true;
+            console.log(`[${id}] Partial ready at ${(bytesReceived / 1024 / 1024).toFixed(1)}MB — starting stream`);
+            onPartialReady(destPath);
+          }
+        });
+
+        res.pipe(file);
+        file.on("finish", () => {
+          file.close(() => {
+            // Download শেষ হলেও onPartialReady fire হয়নি থাকলে (ছোট file) এখন করো
+            if (!partialFired) {
+              partialFired = true;
+              console.log(`[${id}] File complete (${(bytesReceived / 1024 / 1024).toFixed(1)}MB) — starting stream`);
+              onPartialReady(destPath);
+            }
+            resolve();
+          });
+        });
+
+        file.on("error", (err) => {
+          fsp.unlink(destPath).catch(() => {});
+          reject(err);
+        });
+      });
+
+      req.on("error", (err) => {
+        file.close();
+        fsp.unlink(destPath).catch(() => {});
+        reject(err);
+      });
+
+      req.setTimeout(120000, () => {
+        req.destroy();
+        file.close();
+        fsp.unlink(destPath).catch(() => {});
+        reject(new Error(`Download timeout for ${url}`));
+      });
+    }).catch(reject);
+  });
+}
+
+// ─── Progressive resolve ──────────────────────────────────────────────────────
+
+/**
+ * সব file parallel-এ download শুরু করে।
+ * প্রথম file এর MIN_BYTES_TO_START পৌঁছালেই stream চালু হয়।
+ * বাকিগুলো background-এ download হতে থাকে, হলে playlist update হয়।
+ *
+ * @returns {Promise<string[]>} downloadedLocalPaths — cleanup এর জন্য
+ */
+async function resolveFilesProgressive(id, files, playlistPath, onStreamReady) {
+  const resolved = new Array(files.length).fill(null);
+  const downloadedLocalPaths = [];
+  let streamStarted = false;
+
+  // Stream start করার helper — একবারই call হবে
+  async function maybeStartStream() {
+    if (streamStarted || resolved[0] === null) return;
+    streamStarted = true;
+    await writePlaylistFile(playlistPath, resolved.filter(Boolean));
+    await onStreamReady(resolved.filter(Boolean));
+  }
+
+  // Playlist update করার helper — background download complete হলে call হয়
+  async function updatePlaylistIfRunning() {
+    const readyFiles = resolved.filter(Boolean);
+    if (readyFiles.length > 0) {
+      try {
+        await writePlaylistFile(playlistPath, readyFiles);
+      } catch (err) {
+        console.error(`[${id}] Playlist update error: ${err.message}`);
+      }
+    }
+  }
+
+  // প্রথম file — partial ready হলেই stream start করবো
+  const firstFilePromise = (async () => {
+    const file = files[0];
+    if (!isRemoteUrl(file)) {
+      resolved[0] = toLiquidsoapPath(file);
+      await maybeStartStream();
+      return;
+    }
+
+    const ext = path.extname(new URL(file).pathname) || ".mp4";
+    const hash = crypto.createHash("md5").update(file).digest("hex").slice(0, 8);
+    const tmpPath = path.join(DOWNLOADS_DIR, `${id}_${hash}${ext}`);
+
+    // Cache check
+    try {
+      await fsp.access(tmpPath);
+      console.log(`[${id}] Already cached [0]: ${tmpPath}`);
+      downloadedLocalPaths.push(tmpPath);
+      resolved[0] = toLiquidsoapPath(tmpPath);
+      await maybeStartStream();
+      return;
+    } catch { /* not cached, download */ }
+
+    console.log(`[${id}] Downloading [0]: ${file}`);
+
+    // Partial ready callback — MIN_BYTES_TO_START পৌঁছালে stream start
+    await downloadFileProgressive(file, tmpPath, id, async () => {
+      downloadedLocalPaths.push(tmpPath);
+      resolved[0] = toLiquidsoapPath(tmpPath);
+      await maybeStartStream();
+    });
+
+    console.log(`[${id}] Complete [0]: ${tmpPath}`);
+    // Download complete হলে playlist-এ already আছে, update করো
+    await updatePlaylistIfRunning();
+  })();
+
+  // বাকি files — background-এ download, complete হলে playlist update
+  const restPromises = files.slice(1).map(async (file, idx) => {
+    const i = idx + 1;
+
+    if (!isRemoteUrl(file)) {
+      resolved[i] = toLiquidsoapPath(file);
+      await updatePlaylistIfRunning();
+      return;
+    }
+
+    const ext = path.extname(new URL(file).pathname) || ".mp4";
+    const hash = crypto.createHash("md5").update(file).digest("hex").slice(0, 8);
+    const tmpPath = path.join(DOWNLOADS_DIR, `${id}_${hash}${ext}`);
+
+    try {
+      await fsp.access(tmpPath);
+      console.log(`[${id}] Already cached [${i}]: ${tmpPath}`);
+      downloadedLocalPaths.push(tmpPath);
+      resolved[i] = toLiquidsoapPath(tmpPath);
+      await updatePlaylistIfRunning();
+      return;
+    } catch { /* not cached */ }
+
+    console.log(`[${id}] Downloading [${i}]: ${file}`);
+
+    // বাকি files এর জন্য partial callback দরকার নেই, শুধু complete হলেই playlist update
+    await downloadFileProgressive(file, tmpPath, id, () => {
+      // partial ready — বাকি files এর জন্য কিছু করার নেই
+    });
+
+    downloadedLocalPaths.push(tmpPath);
+    resolved[i] = toLiquidsoapPath(tmpPath);
+    console.log(`[${id}] Complete [${i}]: ${tmpPath}`);
+    await updatePlaylistIfRunning();
+  });
+
+  // প্রথম file এর stream start হওয়া পর্যন্ত wait করো
+  await firstFilePromise;
+
+  // বাকিগুলো background-এ চলবে
+  Promise.all(restPromises)
+    .then(() => console.log(`[${id}] All files downloaded and playlist finalized.`))
+    .catch((err) => console.error(`[${id}] Background download error: ${err.message}`));
+
+  return downloadedLocalPaths;
+}
+
+// ─── Stream Start ─────────────────────────────────────────────────────────────
 
 async function startStream(payload) {
   const id = payload.id || Math.random().toString(36).slice(2, 10);
@@ -110,36 +330,103 @@ async function startStream(payload) {
     normalize_for_copy: payload.normalize_for_copy === true,
   };
 
-  if (config.copy_mode === true && config.normalize_for_copy) {
-    config.files = await normalizeFilesForCopy(id, config.files);
+  if (config.files.length === 0) {
+    throw new Error("`files` array is required and cannot be empty.");
   }
 
   const liqPath = path.join(SCRIPTS_DIR, `${id}.liq`);
   const logPath = path.join(LOGS_DIR, `${id}.log`);
   const playlistPath = path.join(PLAYLISTS_DIR, `${id}.txt`);
-  await writePlaylistFile(playlistPath, config.files);
-  const script = makeScript(config, playlistPath);
 
-  await fsp.writeFile(liqPath, script, "utf8");
-  const logStream = fs.createWriteStream(logPath, { flags: "a" });
+  await fsp.mkdir(path.dirname(playlistPath), { recursive: true });
 
-  const child = spawn(LIQUIDSOAP_BIN, [liqPath], {
-    cwd: ROOT_DIR,
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
+  const downloadedFiles = await resolveFilesProgressive(
+    id,
+    config.files,
+    playlistPath,
+    async (initialFiles) => {
+      let resolvedFiles = initialFiles;
 
-  child.stdout.pipe(logStream);
-  child.stderr.pipe(logStream);
-  child.on("exit", () => {
-    logStream.end();
-  });
+      if (config.copy_mode === true && config.normalize_for_copy) {
+        const localPaths = resolvedFiles.map((f) => toOsPath(f));
+        const normalized = await normalizeFilesForCopy(id, localPaths);
+        resolvedFiles = normalized.map((f) => toLiquidsoapPath(f));
+      }
 
-  const job = { id, process: child, liqPath, logPath, playlistPath, createdAt: Date.now(), config };
-  
-  jobs.set(id, job);
-  return jobSummary(job);
+      await writePlaylistFile(playlistPath, resolvedFiles);
+      const script = makeScript(config, playlistPath);
+      await fsp.writeFile(liqPath, script, "utf8");
+
+      const logStream = fs.createWriteStream(logPath, { flags: "a" });
+
+      function writeLog(msg) {
+        const line = `[${new Date().toISOString()}] ${msg}\n`;
+        process.stdout.write(line);
+        logStream.write(line);
+      }
+
+      writeLog(`Starting stream id=${id} (progressive)`);
+      writeLog(`Script: ${liqPath}`);
+      writeLog(`Playlist: ${playlistPath}`);
+      writeLog(`Initial files: ${JSON.stringify(resolvedFiles)}`);
+
+      const child = spawn(LIQUIDSOAP_BIN, [liqPath], {
+        cwd: ROOT_DIR,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      writeLog(`Spawned PID=${child.pid}`);
+
+      function pipeLines(stream, label) {
+        let buf = "";
+        stream.on("data", (chunk) => {
+          buf += chunk.toString();
+          const lines = buf.split("\n");
+          buf = lines.pop();
+          for (const line of lines) {
+            if (line.trim()) writeLog(`[${label}] ${line}`);
+          }
+        });
+        stream.on("end", () => {
+          if (buf.trim()) writeLog(`[${label}] ${buf}`);
+        });
+      }
+
+      pipeLines(child.stdout, "stdout");
+      pipeLines(child.stderr, "stderr");
+
+      child.on("error", (err) => {
+        writeLog(`[error] Failed to spawn liquidsoap: ${err.message}`);
+        logStream.end();
+      });
+
+      child.on("exit", (code, signal) => {
+        writeLog(`[exit] code=${code} signal=${signal}`);
+        logStream.end();
+      });
+
+      jobs.set(id, {
+        id,
+        process: child,
+        liqPath,
+        logPath,
+        playlistPath,
+        downloadedFiles: [],
+        createdAt: Date.now(),
+        config,
+      });
+    }
+  );
+
+  if (jobs.has(id)) {
+    jobs.get(id).downloadedFiles = downloadedFiles;
+  }
+
+  return jobSummary(jobs.get(id));
 }
+
+// ─── Stream Stop ──────────────────────────────────────────────────────────────
 
 async function waitForExit(child, timeoutMs = 7000) {
   if (child.exitCode !== null) return;
@@ -149,20 +436,30 @@ async function waitForExit(child, timeoutMs = 7000) {
   ]);
 }
 
-async function stopStream(id, options = {}) {
-  const { remove = false } = options;
-  const job = jobs.get(id);
-  if (!job) {
-    throw new Error(`Stream '${id}' not found.`);
+async function deleteFileSafe(filePath) {
+  try {
+    await fsp.unlink(filePath);
+    console.log(`[cleanup] Deleted: ${filePath}`);
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.warn(`[cleanup] Could not delete ${filePath}: ${err.message}`);
+    }
   }
+}
 
+async function stopStream(id) {
+  const job = jobs.get(id);
+  if (!job) throw new Error(`Stream '${id}' not found.`);
+
+  // Process kill
   if (job.process.exitCode === null) {
     if (process.platform === "win32") {
       await new Promise((resolve) => {
-        const killer = spawn("taskkill", ["/pid", String(job.process.pid), "/t", "/f"], {
-          windowsHide: true,
-          stdio: "ignore",
-        });
+        const killer = spawn(
+          "taskkill",
+          ["/pid", String(job.process.pid), "/t", "/f"],
+          { windowsHide: true, stdio: "ignore" }
+        );
         killer.on("close", resolve);
       });
       await waitForExit(job.process);
@@ -172,12 +469,19 @@ async function stopStream(id, options = {}) {
     }
   }
 
-  if (remove) {
-    jobs.delete(id);
-  }
+  // Cleanup — .liq, playlist.txt, downloaded videos
+  await Promise.all([
+    deleteFileSafe(job.liqPath),
+    deleteFileSafe(job.playlistPath),
+    ...job.downloadedFiles.map((f) => deleteFileSafe(f)),
+  ]);
 
-  return jobSummary(job);
+  const summary = jobSummary(job);
+  jobs.delete(id);
+  return summary;
 }
+
+// ─── Playlist Update ──────────────────────────────────────────────────────────
 
 async function updatePlaylist(id, files, applyMode = "after_current") {
   if (!Array.isArray(files) || files.length === 0) {
@@ -185,9 +489,7 @@ async function updatePlaylist(id, files, applyMode = "after_current") {
   }
 
   const job = jobs.get(id);
-  if (!job) {
-    throw new Error(`Stream '${id}' not found.`);
-  }
+  if (!job) throw new Error(`Stream '${id}' not found.`);
 
   let nextFiles = files;
   if (job.config.copy_mode === true && job.config.normalize_for_copy) {
@@ -197,25 +499,21 @@ async function updatePlaylist(id, files, applyMode = "after_current") {
   await writePlaylistFile(job.playlistPath, nextFiles);
   job.config.files = nextFiles;
 
-  // after_current: let current track finish naturally.
   if (applyMode === "after_current") {
     return { ...jobSummary(job), apply_mode: "after_current" };
   }
 
-  // immediate: quick restart so new playlist starts right away.
   if (applyMode === "immediate") {
-    const nextConfig = {
-      ...job.config,
-      id,
-      files: nextFiles,
-    };
-    await stopStream(id, { remove: true });
+    const nextConfig = { ...job.config, id, files: nextFiles };
+    await stopStream(id);
     const restarted = await startStream(nextConfig);
     return { ...restarted, apply_mode: "immediate" };
   }
 
   throw new Error("Invalid apply_mode. Use `after_current` or `immediate`.");
 }
+
+// ─── HTTP API ─────────────────────────────────────────────────────────────────
 
 app.register(cors, { origin: true });
 
@@ -262,12 +560,18 @@ app.post("/streams/:id/stop", async (request, reply) => {
 app.post("/streams/:id/playlist", async (request, reply) => {
   try {
     const { files, apply_mode } = request.body || {};
-    const stream = await updatePlaylist(request.params.id, files, apply_mode || "after_current");
+    const stream = await updatePlaylist(
+      request.params.id,
+      files,
+      apply_mode || "after_current"
+    );
     return { stream };
   } catch (error) {
     return reply.code(400).send({ error: error.message });
   }
 });
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
 
 async function boot() {
   ensureDirs();

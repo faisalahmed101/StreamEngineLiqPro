@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  stream-engine:
+    build: .
+    container_name: stream_panel_engine
+    restart: always
+    ports:
+      - "8090:8090"
+    volumes:
+      # আপনার পিসির কোড পরিবর্তন করলে কন্টেইনারে যেন আপডেট হয় (Development এর জন্য)
+      - .:/app
+      # node_modules কে মাউন্ট থেকে বাদ দেওয়া (পারফরম্যান্সের জন্য)
+      - /app/node_modules
+      # লিকুইডসোপের রানটাইম ডেটা পিসিতে সেভ হবে
+      - ./runtime:/app/runtime
+      - ./cache:/app/cache
+    environment:
+      - NODE_ENV=production
+      - PORT=8090
+    # কন্টেইনার যেন অনেক বেশি রিসোর্স না খায় তার লিমিট (ঐচ্ছিক কিন্তু নিরাপদ)
+    deploy:
+      resources:
+        limits:
+          memory: 2G
